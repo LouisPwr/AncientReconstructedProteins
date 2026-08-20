@@ -1,0 +1,278 @@
+import glob
+import pandas as pd
+from snakemake.utils import validate, min_version
+import numpy as np
+import itertools
+
+
+def get_md5sum(x):
+    import hashlib
+
+    return hashlib.md5(x.encode("utf-8")).hexdigest()[:10]
+
+
+"""
+Author: Louis Kraft
+Template: CarpeDeam Paper
+"""
+#
+##### set minimum snakemake version #####
+min_version("6.0.0")
+
+configfile: "config/config.yaml"
+report: "report/workflow.rst"
+
+
+"""
+Working directory
+"""
+
+workdir: config["wdir"]
+
+
+DUPS = ["rmdup"]
+
+# message("The current working directory is " + WDIR)
+
+"""
+ The list of samples to be processed
+"""
+
+# Check if config["rename_reads"] exists. If not, set it to False.
+if "rename_reads" not in config:
+    config["rename_reads"] = True
+elif config["rename_reads"] == "":
+    config["rename_reads"] = True
+
+if not isinstance(config["rename_reads"], bool):
+    raise ValueError("The parameter rename_reads only can be 'True' or 'False'")
+    exit(1)
+
+sample_table_read = pd.read_table(
+    config["sample_file_read"], sep="\t", lineterminator="\n"
+)
+
+# let's check that the basic columns are present
+if not all(item in sample_table_read.columns for item in ["label", "file"]):
+    raise ValueError("The sample table must contain the columns 'label' and 'file'")
+    exit(1)
+
+# By default all studies are treated as ancient
+if not "study_type" in sample_table_read.columns:
+    sample_table_read["study_type"] = "ancient"
+
+# Check if element in column is different from list, if not exit with error
+if not all(item in ["ancient", "modern"] for item in sample_table_read.study_type):
+    raise ValueError("The column 'study_type' must contain only 'ancient' or 'modern'")
+    exit(1)
+
+# If extend_reads is not present, set it to True
+extend_reads_cond = [True, False, "auto"]
+if "extend_reads" in config:
+    if not config["extend_reads"] in extend_reads_cond:
+        raise ValueError(
+            "The parameter extend_reads only can be 'True', 'False' or 'None'"
+        )
+        exit(1)
+else:
+    config["extend_reads"] = True
+
+# Let's check if we extend or not based on the column study_type
+if config["extend_reads"] is True:
+    sample_table_read["extend_reads"] = "TRUE"
+elif config["extend_reads"] is False:
+    sample_table_read["extend_reads"] = "FALSE"
+else:
+    sample_table_read["extend_reads"] = np.where(
+        sample_table_read["study_type"] == "ancient", "TRUE", "FALSE"
+    )
+
+if not "libprep" in sample_table_read.columns:
+    sample_table_read["libprep"] = "double"
+
+sample_table_read = sample_table_read.drop_duplicates(
+    subset="label", keep="first", inplace=False
+)
+sample_table_read = sample_table_read.dropna()
+
+if not "short_label" in sample_table_read.columns:
+    sample_table_read["short_label"] = sample_table_read.apply(
+        lambda row: row.label, axis=1
+    )
+
+# Check if damage profile is provided, if not set it to ""
+if not "damage" in sample_table_read.columns:
+    sample_table_read["damage"] = ""
+
+sample_table_read.set_index("short_label", inplace=True)
+sample_label_dict_read = sample_table_read.to_dict()["label"]
+sample_label_read = sample_table_read.index.values
+
+megahit_configs = [*config["megahit_config"]]
+carpedeam_configs = [*config["carpedeam_config"]]
+
+
+rule all:
+    input:
+        done_trim_and_merge=expand(
+            config["rdir"] + "/reads_merged/{smp}.merge.fq.gz", smp=sample_label_read
+        ),
+        done_sana1=expand(
+            config["rdir"] + "/reads_paired/{smp}_R1.sana.paired.fq.gz", smp=sample_label_read
+        ),
+        done_sana2=expand(
+            config["rdir"] + "/reads_paired/{smp}_R2.sana.paired.fq.gz", smp=sample_label_read
+        ),
+        done_initial_stats=expand(
+            config["rdir"] + "/stats/{smp}.stats-initial.txt", smp=sample_label_read
+        ),
+        done_renamed_reads=expand(
+            config["rdir"] + "/read-renamed/{smp}.fq.gz",
+            smp=sample_label_read,
+        ),
+        done_renamed_reads_mapping=expand(
+            config["rdir"] + "/read-renamed/{smp}.mapping.tsv.gz",
+            smp=sample_label_read,
+        ),
+        done_assm_input_1=expand(
+            f'{config["rdir"]}/assembly-input-1/{{smp}}.{{assm_input_1}}.fastq.gz',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+        ),
+        done_stats_assm_input_1=expand(
+            f'{config["rdir"]}/stats/{{smp}}.{{assm_input_1}}.stats.txt',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+        ),
+        done_assm_input_2=expand(
+            f'{config["rdir"]}/assembly-input-2/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.fastq.gz',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+        ),
+        done_stats_assm_input_2=expand(
+            f'{config["rdir"]}/stats/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.stats.txt',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+        ),
+
+
+# carpedeam
+        # carpedeam assembly
+        done_contigs_carpedeam=expand(
+            f'{config["rdir"]}/assembly/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.assm.carpedeam.{{config}}.fasta',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=carpedeam_configs,
+        ),
+        done_confs_carpedeam=expand(
+            f'{config["rdir"]}/assembly/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.assm.carpedeam.{{config}}.conf',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=carpedeam_configs,
+        ),
+        # carpedeam mmseqs
+        done_carpedeam_mmseqs=expand(
+            f'{config["rdir"]}/assembly-mmseqs-{config["db_name"]}/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.mmseqs.carpedeam.{{config}}.tsv',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=carpedeam_configs,
+        ),
+        done_carpedeam_contigs2=expand(
+            f'{config["rdir"]}/assembly-contig-map/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.mapping.carpedeam.{{config}}.sorted.bam',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=carpedeam_configs,
+        ),
+        # mmseqs prokka
+        done_carpedeam_prokka_mmseqs=expand(
+            f'{config["rdir"]}/assembly-prokka-mmseqs-{config["db_name"]}/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.prokka.carpedeam.{{config}}.tsv',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=carpedeam_configs,
+        ),
+        # orf mapping
+        done_carpedeam_orf_mapping=expand(
+            f'{config["rdir"]}/assembly-orf-map/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.mapping.carpedeam.{{config}}.sorted.bam',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=carpedeam_configs,
+        ),
+
+
+
+# MEGAHIT
+        # megahit assembly
+        done_contigs_megahit=expand(
+            f'{config["rdir"]}/assembly/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.assm.megahit.{{config}}.fasta',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=megahit_configs,
+        ),
+        done_confs_megahit=expand(
+            f'{config["rdir"]}/assembly/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.assm.megahit.{{config}}.conf',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=megahit_configs,
+        ),
+        # megahit mmseqs
+        done_megahit_mmseqs=expand(
+            f'{config["rdir"]}/assembly-mmseqs-{config["db_name"]}/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.mmseqs.megahit.{{config}}.tsv',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=megahit_configs,
+        ),
+        done_megahit_contigs2=expand(
+            f'{config["rdir"]}/assembly-contig-map/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.mapping.megahit.{{config}}.sorted.bam',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=megahit_configs,
+        ),
+        # prokka
+        done_megahit_prokka_mmseqs=expand(
+            f'{config["rdir"]}/assembly-prokka-mmseqs-{config["db_name"]}/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.prokka.megahit.{{config}}.tsv',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=megahit_configs,
+        ),       
+        # orf mapping
+        done_megahit_orf_mapping=expand(
+            f'{config["rdir"]}/assembly-orf-map/{{smp}}.{{assm_input_1}}-{{assm_input_2}}.mapping.megahit.{{config}}.sorted.bam',
+            smp=sample_label_read,
+            assm_input_1=config["assm_input_1"],
+            assm_input_2=config["assm_input_2"],
+            config=megahit_configs,
+        ),
+
+
+
+"""
+##### load rules #####
+"""
+
+include: "rules/merge-reads.smk"
+include: "rules/stats-initial.smk"
+include: "rules/read-rename.smk"
+include: "rules/assembly-input-1.smk"
+include: "rules/assembly-input-2.smk"
+include: "rules/assembly-megahit.smk"
+include: "rules/assembly-carpedeam.smk"
+include: "rules/reads-sana.smk"
+include: "rules/assembly-mmseqs-carpedeam.smk"
+include: "rules/assembly-mmseqs-megahit.smk"
+include: "rules/assembly-contig-map-carpedeam.smk"
+include: "rules/assembly-contig-map-megahit.smk"
+include: "rules/assembly-prokka-mmseqs-carpedeam.smk"
+include: "rules/assembly-prokka-mmseqs-megahit.smk"
